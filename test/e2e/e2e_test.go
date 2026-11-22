@@ -226,17 +226,37 @@ func sameTip(nodes []*testNode) bool {
 	return true
 }
 
-// settle waits until every node has the same tip. Two nodes that mine
-// blocks at the same height keep their own until a longer chain appears
-// (first seen wins, no empty blocks), so if the nodes stay split a
-// tie-breaking transaction is mined: tieAccount pays itself, which costs
-// only the fee and changes no account that a test checks.
-func settle(t *testing.T, nodes []*testNode, lc *client.LightClient, tieSeq *uint64) {
+// inEveryChain reports whether every transaction is in every node's chain.
+func inEveryChain(nodes []*testNode, txs []core.Tx) bool {
+	for _, tn := range nodes {
+		for _, tx := range txs {
+			if _, err := tn.n.Proof(core.TxID(tx)); err != nil {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// settle waits until every node has the same tip and every transaction in
+// txs is in that chain. Two nodes that mine blocks at the same height keep
+// their own until a longer chain appears (first seen wins, no empty blocks),
+// so if the nodes stay split a tie-breaking transaction is mined: tieAccount
+// pays itself, which costs only the fee and changes no account that a test
+// checks.
+//
+// A proof at depth one is not final: a transaction proven in a block that
+// then loses a fork goes back to its node's mempool and is mined again, so
+// the nodes can briefly agree on a tip that does not contain it yet. Waiting
+// for txs closes that window. Nothing is resubmitted, so a transaction that a
+// node really loses still fails the test.
+func settle(t *testing.T, nodes []*testNode, lc *client.LightClient, tieSeq *uint64, txs ...core.Tx) {
 	t.Helper()
 	for attempt := 0; attempt < 6; attempt++ {
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
-			if sameTip(nodes) {
+			// sameTip again afterwards: a tip can move while the chains are read.
+			if sameTip(nodes) && inEveryChain(nodes, txs) && sameTip(nodes) {
 				return
 			}
 			time.Sleep(20 * time.Millisecond)
@@ -246,7 +266,7 @@ func settle(t *testing.T, nodes []*testNode, lc *client.LightClient, tieSeq *uin
 		*tieSeq++
 		t.Logf("tie-breaker %d mined", *tieSeq)
 	}
-	t.Fatal("nodes did not converge on one tip")
+	t.Fatal("nodes did not converge on one tip containing every transaction")
 }
 
 // ---- Tests ----
@@ -274,7 +294,7 @@ func TestSubmitMineProve(t *testing.T) {
 		t.Fatal(errA, errB)
 	}
 	var tie uint64
-	settle(t, nodes, alice, &tie)
+	settle(t, nodes, alice, &tie, txA, txB)
 
 	want := map[int][2]uint64{ // account: balance, next seq
 		0: {consensus.DemoBalance - 105, 1},
@@ -372,7 +392,7 @@ func TestForkResolution(t *testing.T) {
 	mustConfirm(t, onAB, y1)
 	mustConfirm(t, onAB, y2)
 	var tie uint64
-	settle(t, []*testNode{a, b}, onAB, &tie)
+	settle(t, []*testNode{a, b}, onAB, &tie, y1, y2)
 	hc, _ := c.n.Tip()
 	ha, _ := a.n.Tip()
 	if hc >= ha {
@@ -388,8 +408,9 @@ func TestForkResolution(t *testing.T) {
 
 	// Heal: the next majority block reaches c, which syncs from its sender.
 	c.isolated.Store(false)
-	mustConfirm(t, onAB, core.Tx{Sender: acct(5), Recipient: acct(6), Amount: 1, Fee: 1, Seq: 0})
-	settle(t, nodes, onAB, &tie)
+	heal := core.Tx{Sender: acct(5), Recipient: acct(6), Amount: 1, Fee: 1, Seq: 0}
+	mustConfirm(t, onAB, heal)
+	settle(t, nodes, onAB, &tie, y1, y2, heal)
 
 	if _, err := c.n.Proof(core.TxID(x)); !errors.Is(err, core.ErrNotFound) {
 		t.Errorf("minority transaction still in c's chain: %v", err)
@@ -538,8 +559,14 @@ func TestConcurrentStress(t *testing.T) {
 	if err := errors.Join(errs...); err != nil {
 		t.Fatal(err)
 	}
+	var all []core.Tx
+	for i := 0; i < senders; i++ {
+		for s := 0; s < perSender; s++ {
+			all = append(all, core.Tx{Sender: acct(i), Recipient: acct((i + 1) % senders), Amount: 10, Fee: fee(i), Seq: uint64(s)})
+		}
+	}
 	var tie uint64
-	settle(t, nodes, lcs[0], &tie)
+	settle(t, nodes, lcs[0], &tie, all...)
 
 	for _, tn := range nodes {
 		for i := 0; i < senders; i++ {
